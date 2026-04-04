@@ -1,0 +1,26 @@
+module Framework.PropertyTests where
+
+import Daml.Script
+
+data Property a = Property
+  with
+    name      : Text
+    generator : Int -> a
+    predicate : a -> Bool
+    runs      : Int
+
+runProperty : Property a -> Script ()
+runProperty prop = do
+  let results = map (\seed -> prop.predicate (prop.generator seed)) [1..prop.runs]
+  let failures = filter not results
+  if null failures
+    then debug $ "PASS " <> prop.name <> " (" <> show prop.runs <> " runs)"
+    else assertFail $ "FAIL " <> prop.name <> ": " <> show (length failures) <> " failures"
+
+intProperty : Text -> (Int -> Bool) -> Property Int
+intProperty name pred_ = Property
+  with
+    name      = name
+    generator = id
+    predicate = pred_
+    runs      = 100
