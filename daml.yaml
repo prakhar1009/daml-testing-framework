@@ -1,0 +1,10 @@
+sdk-version: 2.9.0
+name: daml-testing-framework
+version: 0.1.0
+source: daml
+build-options:
+  - --ghc-option=-Werror
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
