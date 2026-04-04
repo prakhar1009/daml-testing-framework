@@ -1,0 +1,27 @@
+module Framework.Assertions where
+
+import Daml.Script
+
+assertEq : (Show a, Eq a) => Text -> a -> a -> Script ()
+assertEq label expected actual =
+  if expected == actual
+    then return ()
+    else assertFail $ label <> ": expected " <> show expected <> ", got " <> show actual
+
+assertNe : (Show a, Eq a) => Text -> a -> a -> Script ()
+assertNe label unexpected actual =
+  if unexpected /= actual
+    then return ()
+    else assertFail $ label <> ": expected not " <> show unexpected
+
+assertGt : (Show a, Ord a) => Text -> a -> a -> Script ()
+assertGt label floor_ actual =
+  if actual > floor_
+    then return ()
+    else assertFail $ label <> ": expected > " <> show floor_ <> ", got " <> show actual
+
+assertContains : Eq a => Text -> [a] -> a -> Script ()
+assertContains label xs x =
+  if x `elem` xs
+    then return ()
+    else assertFail $ label <> ": element not found in list"
