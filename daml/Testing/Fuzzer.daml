@@ -1,0 +1,227 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Testing.Fuzzer where
+
+import Daml.Script
+import DA.Random
+import DA.Date hiding (day, month, year)
+import DA.Time
+import DA.List (concat, head, tail, sum, replicateA)
+import DA.Text (Text, pack, unpack, take)
+import DA.Optional (Optional(..))
+import DA.TextMap (TextMap, fromList)
+import DA.Logic
+import DA.Functor
+import DA.Applicative
+import DA.Monad
+import DA.Int
+import DA.Decimal
+import DA.Numeric (intToDecimal)
+import DA.Assert
+
+-- | A generator for values of type `a`. It encapsulates a function that,
+-- given a random seed, produces a value and a new seed for subsequent
+-- random generation.
+newtype Gen a = Gen (StdGen -> (a, StdGen))
+
+-- | The `Gen` type is a functor, allowing you to apply a function to the
+-- generated value without affecting the random generation process.
+instance Functor Gen where
+  fmap f (Gen g) = Gen (\seed -> let (x, seed') = g seed in (f x, seed'))
+
+-- | The `Gen` type is an applicative functor, allowing you to combine
+-- generators. For example, you can generate a function and a value, and
+-- then apply the function to the value.
+instance Applicative Gen where
+  pure x = Gen (\seed -> (x, seed))
+  (Gen f) <*> (Gen x) = Gen (\seed ->
+    let (f', seed') = f seed
+        (x', seed'') = x seed'
+    in (f' x', seed''))
+
+-- | The `Gen` type is a monad, enabling the sequencing of generators where
+-- the next generator can depend on the value produced by the previous one.
+instance Monad Gen where
+  (Gen g) >>= f = Gen (\seed ->
+    let (x, seed') = g seed
+        (Gen g') = f x
+    in g' seed')
+
+-- | Runs a generator with a given seed to produce a value and the next seed.
+runGen : StdGen -> Gen a -> (a, StdGen)
+runGen seed (Gen f) = f seed
+
+-- | Samples a single value from a generator within a `Daml.Script`.
+-- It uses the current ledger time to create an initial seed, ensuring
+-- different results on different runs.
+sample : Gen a -> Script a
+sample gen = do
+  time <- getTime
+  let seed = mkStdGen (timeToMicros time)
+  let (val, _) = runGen seed gen
+  return val
+
+-- | Samples `n` values from a generator within a `Daml.Script`.
+sampleN : Int -> Gen a -> Script [a]
+sampleN n gen = do
+  time <- getTime
+  let initialSeed = mkStdGen (timeToMicros time)
+  let
+    go 0 _ acc = acc
+    go k seed acc =
+      let (val, nextSeed) = runGen seed gen
+      in go (k - 1) nextSeed (val :: acc)
+  return $ reverse (go n initialSeed [])
+
+-- | Generates an integer within the specified inclusive range.
+-- The range `(min, max)` must be valid (`min <= max`).
+genInt : Int -> Int -> Gen Int
+genInt min max = assert (min <= max) $
+  Gen (uniformInt min max)
+
+-- | Generates an `Int64` within the specified inclusive range.
+-- The range `(min, max)` must be valid (`min <= max`).
+genInt64 : Int64 -> Int64 -> Gen Int64
+genInt64 min max = assert (min <= max) $
+  Gen (uniformInt64 min max)
+
+-- | Generates a `Decimal` within the specified inclusive range, with a fixed
+-- number of decimal places (scale).
+-- The range `(minVal, maxVal)` must be valid. `scale` must be between 0 and 10.
+genDecimal : Decimal -> Decimal -> Int -> Gen Decimal
+genDecimal minVal maxVal scale = assert (minVal <= maxVal && scale >= 0 && scale <= 10) $ do
+  let
+    powerOf10 = 10.0 ^ scale
+    minInt = round (minVal * powerOf10)
+    maxInt = round (maxVal * powerOf10)
+  val <- genInt64 minInt maxInt
+  return (intToDecimal val / powerOf10)
+
+-- | Generates a random `Bool`.
+genBool : Gen Bool
+genBool = Gen (\seed ->
+  let (i, seed') = uniformInt 0 1 seed
+  in (i == 1, seed'))
+
+-- | Generates a random `Time` within the specified inclusive range.
+genTime : Time -> Time -> Gen Time
+genTime minTime maxTime = assert (minTime <= maxTime) $ do
+  let
+    minMicros = timeToMicros minTime
+    maxMicros = timeToMicros maxTime
+  micros <- genInt64 minMicros maxMicros
+  return $ timeFromMicros micros
+
+-- | Generates a random `Date` within the specified inclusive range.
+genDate : Date -> Date -> Gen Date
+genDate minDate maxDate = assert (minDate <= maxDate) $ do
+  let
+    minDays = dateToDays minDate
+    maxDays = dateToDays maxDate
+  days <- genInt minDays maxDays
+  return $ dateFromDays days
+
+-- | Picks a random `Party` from a given list of parties.
+-- The list of parties must not be empty.
+genParty : [Party] -> Gen Party
+genParty parties = assert (not $ null parties) $
+  elements parties
+
+-- | Generates a random alphanumeric character (`a-z`, `A-Z`, `0-9`).
+genAlphaNumChar : Gen Char
+genAlphaNumChar = elements (
+  ['a'..'z'] ++ ['A'..'Z'] ++ ['0'..'9']
+  )
+
+-- | Generates a random printable ASCII character.
+genPrintableChar : Gen Char
+genPrintableChar = elements [' '..'~']
+
+-- | Generates a random `Text` of a given length, composed of alphanumeric characters.
+genText : Int -> Gen Text
+genText len = do
+  chars <- replicateA len genAlphaNumChar
+  return $ pack chars
+
+-- | Generates a random `Text` with a length in the given range.
+genTextRange : Int -> Int -> Gen Text
+genTextRange minLen maxLen = do
+  len <- genInt minLen maxLen
+  genText len
+
+-- | Chooses a random element from a non-empty list.
+elements : [a] -> Gen a
+elements xs = assert (not $ null xs) $ do
+  idx <- genInt 0 (length xs - 1)
+  return (xs !! idx)
+
+-- | Randomly chooses one of the given generators to run.
+-- The list of generators must not be empty.
+oneof : [Gen a] -> Gen a
+oneof gens = assert (not $ null gens) $ do
+  gen <- elements gens
+  gen
+
+-- | Chooses a generator from a list with weighted probabilities.
+-- The list must not be empty, and all weights must be positive.
+frequency : [(Int, Gen a)] -> Gen a
+frequency xs = assert (not (null xs) && all (\(w, _) -> w > 0) xs) $ do
+  let total = sum $ map fst xs
+  i <- genInt 1 total
+  return $ pick i xs
+  where
+    pick : Int -> [(Int, Gen a)] -> Gen a
+    pick n ((w, g) :: rest) =
+      if n <= w then g else pick (n - w) rest
+    pick _ [] = error "Fuzzer.frequency: reached end of list, this should not happen."
+
+-- | Generates a list of random length between `minLen` and `maxLen`,
+-- with elements produced by the given generator.
+genList : Int -> Int -> Gen a -> Gen [a]
+genList minLen maxLen gen = do
+  len <- genInt minLen maxLen
+  replicateA len gen
+
+-- | Generates a non-empty list of random length between `minLen` and `maxLen`.
+-- `minLen` is clamped to be at least 1.
+genList1 : Int -> Int -> Gen a -> Gen [a]
+genList1 minLen maxLen = genList (max 1 minLen) maxLen
+
+-- | Given a generator for `a`, creates a generator for `Optional a`.
+-- There is a 50% chance of generating `None`.
+genOptional : Gen a -> Gen (Optional a)
+genOptional gen = oneof [pure None, Some <$> gen]
+
+-- | Generates a `TextMap` with a random number of entries between
+-- `minSize` and `maxSize`. Keys and values are produced by the given generators.
+genMap : Int -> Int -> Gen Text -> Gen v -> Gen (TextMap v)
+genMap minSize maxSize genKey genVal = do
+  size <- genInt minSize maxSize
+  entries <- replicateA size ((,) <$> genKey <*> genVal)
+  return $ fromList entries
+
+-- | A generator for creating "edge case" decimals, such as zero, very large
+-- numbers, very small numbers, and numbers close to integers.
+genBoundaryDecimal : Gen Decimal
+genBoundaryDecimal = frequency
+  [ (10, pure 0.0)
+  , (5, genDecimal 1.0e8 1.0e10 2)      -- Large values
+  , (5, genDecimal (-1.0e10) (-1.0e8) 2) -- Large negative values
+  , (5, genDecimal 0.0000000001 0.0001 10) -- Small positive values
+  , (5, genDecimal (-0.0001) (-0.0000000001) 10) -- Small negative values
+  , (2, genDecimal 0.9999999990 0.9999999999 10) -- Close to 1 (below)
+  , (2, genDecimal 1.0000000001 1.0000000010 10) -- Close to 1 (above)
+  ]
+
+-- | A generator for creating potentially problematic text inputs, including
+-- empty strings, very long strings, and strings with special characters or unicode.
+genBoundaryText : Gen Text
+genBoundaryText = frequency
+  [ (10, pure "") -- Empty string
+  , (5, genText 1024) -- Long string
+  , (5, pack <$> replicateA 200 (elements [" ", "\t", "\n"])) -- Whitespace
+  , (5, pack <$> replicateA 50 (elements ["'", "\"", "\\", "`"])) -- Quotes and escapes
+  , (5, pack <$> replicateA 50 (elements ["<", ">", "&", ";", "|"])) -- HTML/Shell special chars
+  , (5, pack <$> replicateA 20 (elements ["\x0000", "\x1F913", "\x1F600", "\x1F4A9"])) -- Unicode/Control chars
+  ]
