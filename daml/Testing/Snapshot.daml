@@ -1,0 +1,153 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Testing.Snapshot (
+  SnapshotQuery,
+  makeSnapshotQuery,
+  createSnapshot,
+  assertSnapshot,
+) where
+
+import Daml.Script
+import DA.List (sort, sortOn)
+import qualified DA.Map as Map
+import qualified DA.Text as T
+import DA.Traversable (forA, sequence)
+
+-- | Provides tools for snapshot testing of Daml ledgers. Snapshot testing is a
+--   powerful technique to verify the state of the Active Contract Set (ACS)
+--   without writing dozens of individual assertions.
+--
+--   The workflow is as follows:
+--   1. Write a Daml Script test that sets up a specific ledger state.
+--   2. Use `createSnapshot` to generate a textual representation of the ACS
+--      for the parties and templates you care about.
+--   3. Run the script once, copy the output, and store it as a `Text` literal
+--      in your test file.
+--   4. In subsequent test runs, use `assertSnapshot` with the stored `Text` to
+--      ensure that the ledger state has not changed unexpectedly. If it has,
+--      the test will fail and print a diff.
+--
+--   Example Usage:
+--   ```daml
+--   module MyModule.Tests where
+--
+--   import Daml.Script
+--   import qualified DA.Text as T
+--   import Testing.Snapshot
+--   import MyModule (MyTemplate, OtherTemplate)
+--
+--   testMyWorkflow : Script ()
+--   testMyWorkflow = script do
+--     alice <- allocateParty "Alice"
+--     bob <- allocateParty "Bob"
+--
+--     -- ... submit transactions that create contracts ...
+--     submit alice do createCmd MyTemplate with owner = alice, value = 100.0
+--     submit bob do createCmd OtherTemplate with party = bob, data = "example"
+--
+--     let
+--       -- Define which contracts to include in the snapshot.
+--       queries =
+--         [ makeSnapshotQuery @MyTemplate [alice]
+--         , makeSnapshotQuery @OtherTemplate [bob]
+--         ]
+--
+--       -- The expected snapshot, captured from a previous successful run.
+--       -- Note: The package hash will be specific to your project build.
+--       expected =
+--         """
+--         -ace8b783b:MyModule:MyTemplate:
+--             MyModule:MyTemplate {owner = 'Alice::...', value = 100.0}
+--
+--         -ace8b783b:MyModule:OtherTemplate:
+--             MyModule:OtherTemplate {party = 'Bob::...', data = "example"}
+--         """
+--
+--     -- Assert that the current state matches the snapshot. Use T.strip to
+--     -- remove leading/trailing whitespace from the multiline string literal.
+--     assertSnapshot (T.strip expected) queries
+--   ```
+--
+type SnapshotQuery = Script [Text]
+
+-- | Creates a query action for a single template type `t`.
+--
+--   This action, when executed, will find all active contracts of that type
+--   visible to *any* of the given `parties`. It formats each contract into a
+--   stable, multi-line string representation, ensuring deterministic output
+--   for reliable comparisons. Duplicate contracts seen by multiple parties are
+--   automatically handled.
+makeSnapshotQuery : forall t. (IsContract t, Show t) => [Party] -> SnapshotQuery
+makeSnapshotQuery parties = do
+  -- For each party, query contracts of type `t`. This gives a `[[ (ContractId t, t) ]]`.
+  allContracts <- concat <$> forA parties (query @t)
+
+  -- Use a Map to deduplicate contracts by ContractId, as multiple parties might
+  -- see the same contract.
+  let uniqueContractMap = Map.fromList allContracts
+
+  -- Get the payloads and sort them by their string representation to ensure
+  -- the output order is deterministic, regardless of creation order.
+  let payloads = Map.values uniqueContractMap
+  let sortedPayloads = sortOn show payloads
+
+  -- Format each payload into a stable, readable string.
+  -- The format includes the template ID and an indented payload.
+  let formatPayload payload =
+        let
+          templateIdStr = show (templateId @t)
+          -- Indent the payload string for readability, handling multi-line payloads correctly.
+          payloadStr = T.intercalate "\n    " (T.splitOn "\n" (show payload))
+        in
+          templateIdStr <> ":\n    " <> payloadStr
+
+  pure $ map formatPayload sortedPayloads
+
+-- | Takes a list of `SnapshotQuery` actions, executes them, and combines the
+--   results into a single, sorted, stable `Text` snapshot.
+--
+--   This is the primary function for generating a snapshot string to be stored
+--   in your test files.
+createSnapshot : [SnapshotQuery] -> Script Text
+createSnapshot queries = do
+  -- Execute each query action to get a list of lists of formatted contract strings.
+  results <- sequence queries
+
+  -- Flatten the list of lists into a single list of all contract strings.
+  let allLines = concat results
+
+  -- Sort the combined list of contract strings alphabetically. This is crucial
+  -- for ensuring the final snapshot is stable and deterministic, regardless of
+  -- the order of templates or their creation.
+  let sortedLines = sort allLines
+
+  -- Join the sorted lines with blank lines in between for readability.
+  pure (T.intercalate "\n\n" sortedLines)
+
+-- | Asserts that the current ledger state, as captured by the given queries,
+--   matches a stored snapshot.
+--
+--   If the actual state does not match the `expectedSnapshot`, the script will
+--   abort with a detailed error message showing the expected and actual states.
+assertSnapshot :
+  Text             -- ^ The expected snapshot, usually a multiline `Text` literal.
+  -> [SnapshotQuery] -- ^ A list of queries defining the scope of the snapshot.
+  -> Script ()
+assertSnapshot expectedSnapshot queries = do
+  -- Generate a fresh snapshot of the current ledger state.
+  actualSnapshot <- createSnapshot queries
+
+  -- Compare with the expected snapshot.
+  if actualSnapshot == expectedSnapshot
+    then pure ()
+    else abort $
+      "\n\n[SNAPSHOT MISMATCH]\n" <>
+      "The current ledger state does not match the expected snapshot.\n\n" <>
+      "========================= EXPECTED =========================\n" <>
+      expectedSnapshot <> "\n" <>
+      "============================================================\n\n" <>
+      "========================== ACTUAL ==========================\n" <>
+      actualSnapshot <> "\n" <>
+      "============================================================\n\n" <>
+      "Hint: If this change is intentional, update the expected snapshot in your test file with the 'ACTUAL' output above.\n"
