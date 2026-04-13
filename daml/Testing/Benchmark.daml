@@ -1,0 +1,149 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+-- | Provides utilities for benchmarking Daml Script actions. This allows developers
+-- to measure and compare the performance of different contract choices and workflows.
+--
+-- The core functionality revolves around the `benchmark` function, which repeatedly
+-- executes a given `Script` action, records the execution time for each run, and
+-- computes aggregate statistics like total, average, minimum, and maximum time.
+--
+-- Example usage in a Daml Script test:
+--
+-- > import Testing.Benchmark
+-- >
+-- > benchmarkMyChoice : Script ()
+-- > benchmarkMyChoice = do
+-- >   -- 1. Setup the initial state (parties, contracts)
+-- >   alice <- allocateParty "Alice"
+-- >   myContractCid <- submit alice do create MyTemplate with owner = alice
+-- >
+-- >   -- 2. Run and report the benchmark
+-- >   -- This will exercise the 'MyChoice' on the contract 50 times and
+-- >   -- print a summary of the execution times.
+-- >   let action = submit alice do exercise myContractCid MyChoice
+-- >   benchmarkAndReport "MyTemplate:MyChoice" 50 action
+-- >   return ()
+module Testing.Benchmark where
+
+import Daml.Script
+import DA.Action (void)
+import DA.Assert (assertMsg)
+import DA.Conversion (intToDecimal)
+import DA.Foldable (sum, minimum, maximum)
+import DA.Math (round)
+import DA.Optional (fromSome)
+import DA.Text (Text, show, replicate)
+import DA.Time (RelTime, diffRelTime, relTimeToMicroseconds, relTimeFromMicroseconds)
+
+-- | Holds the results of a benchmark run for a specific action.
+data BenchmarkResult = BenchmarkResult with
+  label : Text
+  -- ^ A descriptive name for the benchmarked action.
+  runs : Int
+  -- ^ The total number of times the action was executed.
+  totalTime : RelTime
+  -- ^ The cumulative time for all runs.
+  minTime : RelTime
+  -- ^ The shortest execution time recorded for a single run.
+  maxTime : RelTime
+  -- ^ The longest execution time recorded for a single run.
+  avgTime : RelTime
+  -- ^ The average execution time across all runs.
+  deriving (Eq, Show)
+
+-- | A convenience record that groups the primary benchmarking functions.
+-- This can be used to pass the benchmarking utilities around as a single argument.
+benchmarkTools : Benchmark
+benchmarkTools = Benchmark with
+  benchmark = benchmark
+  report = reportBenchmark
+  run = benchmarkAndReport
+
+-- | A record containing benchmarking utilities.
+data Benchmark = Benchmark with
+  benchmark : forall a. Text -> Int -> Script a -> Script BenchmarkResult
+  -- ^ Runs a given script action `n` times, collects timing data,
+  -- but does not print the results.
+  -- Returns a `BenchmarkResult` with the aggregated statistics.
+  report : BenchmarkResult -> Script ()
+  -- ^ Takes a `BenchmarkResult` and prints a formatted summary to the console.
+  run : forall a. Text -> Int -> Script a -> Script BenchmarkResult
+  -- ^ A convenience function that combines `benchmark` and `report`.
+  -- It runs the benchmark and immediately prints the results.
+
+-- | Formats a `RelTime` duration into a human-readable string in milliseconds.
+-- E.g., a `RelTime` of 1.234 seconds becomes "1234.0ms".
+formatRelTime : RelTime -> Text
+formatRelTime rt =
+  let
+    micros = relTimeToMicroseconds rt
+    ms = intToDecimal micros / 1000.0
+  in show ms <> "ms"
+
+-- | Prints a formatted summary of a `BenchmarkResult` to the console using `debug`.
+reportBenchmark : BenchmarkResult -> Script ()
+reportBenchmark result = do
+  let border = replicate 50 "─"
+  debug ""
+  debug $ "┌" <> border <> "┐"
+  debug $ "│ Benchmark Results: " <> result.label
+  debug $ "├" <> border <> "┤"
+  debug $ "│ Runs:       " <> show result.runs
+  debug $ "│ Total time: " <> formatRelTime result.totalTime
+  debug $ "│ Avg time:   " <> formatRelTime result.avgTime
+  debug $ "│ Min time:   " <> formatRelTime result.minTime
+  debug $ "│ Max time:   " <> formatRelTime result.maxTime
+  debug $ "└" <> border <> "┘"
+  debug ""
+
+-- | Runs a given script action `n` times and collects timing data.
+--
+-- This function is the core of the benchmarking utility. It repeatedly executes the
+-- provided `action`, measuring the wall-clock time for each execution using `getTime`.
+-- It then aggregates these timings into a `BenchmarkResult`.
+--
+-- Note: This does not print the results. Use `reportBenchmark` or `benchmarkAndReport` for that.
+--
+-- Fails if `n` is not positive.
+benchmark : forall a. Text -> Int -> Script a -> Script BenchmarkResult
+benchmark label n action = do
+  assertMsg "Number of benchmark runs must be positive." (n > 0)
+
+  -- Recursive helper to run the action `n` times and collect durations.
+  let
+    go : Int -> [RelTime] -> Script [RelTime]
+    go 0 durations = return durations
+    go k durations = do
+      t0 <- getTime
+      void action
+      t1 <- getTime
+      let duration = diffRelTime t1 t0
+      go (k - 1) (duration :: durations)
+
+  durations <- go n []
+
+  -- Calculate statistics from the collected durations.
+  let
+    totalTime = sum durations
+    totalMicros = relTimeToMicroseconds totalTime
+    avgMicros = round (intToDecimal totalMicros / intToDecimal n)
+
+  return BenchmarkResult with
+    label = label
+    runs = n
+    totalTime = totalTime
+    -- `fromSome` is safe here because we asserted n > 0, so `durations` is not empty.
+    minTime = fromSome (minimum durations)
+    maxTime = fromSome (maximum durations)
+    avgTime = relTimeFromMicroseconds avgMicros
+
+-- | A convenience function that runs a benchmark and immediately prints a formatted
+-- summary of the results to the console.
+--
+-- This is equivalent to calling `benchmark` and then passing the result to `reportBenchmark`.
+benchmarkAndReport : forall a. Text -> Int -> Script a -> Script BenchmarkResult
+benchmarkAndReport label n action = do
+  result <- benchmark label n action
+  reportBenchmark result
+  return result
